@@ -85,9 +85,10 @@ import GHC.Generics (Generic)
 import GHC.IO.Exception (IOErrorType (..))
 import GHC.IO.Handle.Internals (ioe_EOF)
 import Generic.Random (genericArbitraryU)
-import Network.Socket
-import qualified Network.TLS as T
-import qualified Network.TLS.Extra as TE
+import Network.Socket hiding (HostName)
+import Network.TLS as T
+import Network.TLS.Extra as TE
+import qualified Network.TLS.Extra.Cipher as TEC
 import qualified Simplex.Messaging.Crypto as C
 import Simplex.Messaging.Encoding
 import Simplex.Messaging.Parsers (parse, parseRead1)
@@ -234,7 +235,8 @@ loadTLSServerParams caCertificateFile certificateFile privateKeyFile =
   where
     loadServerCredential :: IO T.Credential
     loadServerCredential =
-      T.credentialLoadX509Chain certificateFile [caCertificateFile] privateKeyFile >>= \case
+      -- T.credentialLoadX509Chain certificateFile [caCertificateFile] privateKeyFile >>= \case
+      T.credentialLoadX509 certificateFile privateKeyFile >>= \case
         Right credential -> pure credential
         Left _ -> putStrLn "invalid credential" >> exitFailure
     fromCredential :: T.Credential -> T.ServerParams
@@ -243,7 +245,18 @@ loadTLSServerParams caCertificateFile certificateFile privateKeyFile =
         { T.serverWantClientCert = False,
           T.serverShared = def {T.sharedCredentials = T.Credentials [credential]},
           T.serverHooks = def,
-          T.serverSupported = supportedParameters
+          T.serverSupported = serverSupported
+        }
+    serverSupported :: T.Supported
+    serverSupported =
+      def
+        { supportedVersions = [TLS12],
+          supportedCiphers = TEC.ciphersuite_strong_det, --[TEC.cipher_ECDHE_ECDSA_CHACHA20POLY1305_SHA256, TEC.cipher_ECDHE_RSA_CHACHA20POLY1305_SHA256, TEC.cipher_ECDHE_ECDSA_AES256GCM_SHA384, TEC.cipher_ECDHE_RSA_AES256GCM_SHA384],
+          supportedHashSignatures = [(HashIntrinsic, SignatureEd448), (HashIntrinsic, SignatureEd25519), (HashSHA256, SignatureECDSA), (HashSHA384, SignatureECDSA), (HashSHA512, SignatureECDSA), (HashIntrinsic, SignatureRSApssRSAeSHA512), (HashIntrinsic, SignatureRSApssRSAeSHA384), (HashIntrinsic, SignatureRSApssRSAeSHA256), (HashSHA512, SignatureRSA), (HashSHA384, SignatureRSA), (HashSHA256, SignatureRSA)],
+          supportedSecureRenegotiation = False,
+          supportedClientInitiatedRenegotiation = False,
+          supportedSession = True,
+          supportedGroups = [X25519, X448]
         }
 
 loadFingerprint :: FilePath -> IO Fingerprint
@@ -295,8 +308,18 @@ mkTLSClientParams host port keyHash = do
   (T.defaultParamsClient host p)
     { T.clientShared = def,
       T.clientHooks = def {T.onServerCertificate = \_ _ _ -> validateCertificateChain keyHash host p},
-      T.clientSupported = supportedParameters
+      T.clientSupported = clientSupported
     }
+  where
+    clientSupported :: T.Supported
+    clientSupported =
+      def
+        { T.supportedVersions = [T.TLS12],
+          T.supportedCiphers = [TE.cipher_ECDHE_ECDSA_CHACHA20POLY1305_SHA256],
+          T.supportedHashSignatures = [(T.HashIntrinsic, T.SignatureEd448), (T.HashIntrinsic, T.SignatureEd25519)],
+          T.supportedSecureRenegotiation = False,
+          T.supportedGroups = [T.X448, T.X25519]
+        }
 
 validateCertificateChain :: C.KeyHash -> HostName -> ByteString -> X.CertificateChain -> IO [XV.FailedReason]
 validateCertificateChain _ _ _ (X.CertificateChain []) = pure [XV.EmptyChain]
@@ -315,16 +338,6 @@ validateCertificateChain (C.KeyHash kh) host port cc@(X.CertificateChain sc@[_, 
         cache = XV.exceptionValidationCache [] -- we manually check fingerprint only of the identity certificate (ca.crt)
         serviceID = (host, port)
 validateCertificateChain _ _ _ _ = pure [XV.AuthorityTooDeep]
-
-supportedParameters :: T.Supported
-supportedParameters =
-  def
-    { T.supportedVersions = [T.TLS12],
-      T.supportedCiphers = [TE.cipher_ECDHE_ECDSA_CHACHA20POLY1305_SHA256],
-      T.supportedHashSignatures = [(T.HashIntrinsic, T.SignatureEd448), (T.HashIntrinsic, T.SignatureEd25519)],
-      T.supportedSecureRenegotiation = False,
-      T.supportedGroups = [T.X448, T.X25519]
-    }
 
 instance Transport TLS where
   transportName _ = "TLS 1.2"
