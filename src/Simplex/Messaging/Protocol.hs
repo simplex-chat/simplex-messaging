@@ -104,6 +104,7 @@ module Simplex.Messaging.Protocol
     EntityId (..),
     pattern NoEntity,
     QueueId,
+    BlobId,
     RecipientId,
     SenderId,
     NotifierId,
@@ -117,6 +118,8 @@ module Simplex.Messaging.Protocol
     NtfPublicAuthKey,
     RcvNtfPublicDhKey,
     RcvNtfDhSecret,
+    DataPrivateAuthKey,
+    DataPublicAuthKey,
     Message (..),
     RcvMessage (..),
     MsgId,
@@ -136,6 +139,8 @@ module Simplex.Messaging.Protocol
     FwdResponse (..),
     FwdTransmission (..),
     MsgFlags (..),
+    DataBlob (..),
+    EncDataBlob,
     initialSMPClientVersion,
     currentSMPClientVersion,
     userProtocol,
@@ -377,6 +382,8 @@ type NotifierId = QueueId
 -- | SMP queue ID on the server.
 type QueueId = EntityId
 
+type BlobId = EntityId
+
 -- this type is used for server entities only
 newtype EntityId = EntityId {unEntityId :: ByteString}
   deriving (Eq, Ord, Show)
@@ -404,6 +411,10 @@ data Command (p :: Party) where
   OFF :: Command Recipient
   DEL :: Command Recipient
   QUE :: Command Recipient
+  -- Data storage commands
+  WRT :: DataPublicAuthKey -> DataBlob -> Command Recipient
+  CLR :: Command Recipient
+  READ :: Command Sender
   -- SMP sender commands
   SKEY :: SndPublicAuthKey -> Command Sender
   -- SEND v1 has to be supported for encoding/decoding
@@ -412,6 +423,7 @@ data Command (p :: Party) where
   PING :: Command Sender
   -- SMP notification subscriber commands
   NSUB :: Command Notifier
+  -- Proxy commands
   PRXY :: SMPServer -> Maybe BasicAuth -> Command ProxiedClient -- request a relay server connection by URI
   -- Transmission to proxy:
   -- - entity ID: ID of the session with relay returned in PKEY (response to PRXY)
@@ -485,6 +497,7 @@ data BrokerMsg where
   PRES :: EncResponse -> BrokerMsg -- proxy to client
   END :: BrokerMsg
   INFO :: QueueInfo -> BrokerMsg
+  DATA :: EncDataBlob -> BrokerMsg
   OK :: BrokerMsg
   ERR :: ErrorType -> BrokerMsg
   PONG :: BrokerMsg
@@ -682,6 +695,9 @@ data CommandTag (p :: Party) where
   OFF_ :: CommandTag Recipient
   DEL_ :: CommandTag Recipient
   QUE_ :: CommandTag Recipient
+  WRT_ :: CommandTag Recipient
+  CLR_ :: CommandTag Recipient
+  READ_ :: CommandTag Sender
   SKEY_ :: CommandTag Sender
   SEND_ :: CommandTag Sender
   PING_ :: CommandTag Sender
@@ -706,6 +722,7 @@ data BrokerMsgTag
   | PRES_
   | END_
   | INFO_
+  | DATA_
   | OK_
   | ERR_
   | PONG_
@@ -731,6 +748,9 @@ instance PartyI p => Encoding (CommandTag p) where
     OFF_ -> "OFF"
     DEL_ -> "DEL"
     QUE_ -> "QUE"
+    WRT_ -> "WRT"
+    CLR_ -> "CLR"
+    READ_ -> "READ"
     SKEY_ -> "SKEY"
     SEND_ -> "SEND"
     PING_ -> "PING"
@@ -752,6 +772,9 @@ instance ProtocolMsgTag CmdTag where
     "OFF" -> Just $ CT SRecipient OFF_
     "DEL" -> Just $ CT SRecipient DEL_
     "QUE" -> Just $ CT SRecipient QUE_
+    "WRT" -> Just $ CT SRecipient WRT_
+    "CLR" -> Just $ CT SRecipient CLR_
+    "READ" -> Just $ CT SSender READ_
     "SKEY" -> Just $ CT SSender SKEY_
     "SEND" -> Just $ CT SSender SEND_
     "PING" -> Just $ CT SSender PING_
@@ -779,6 +802,7 @@ instance Encoding BrokerMsgTag where
     PRES_ -> "PRES"
     END_ -> "END"
     INFO_ -> "INFO"
+    DATA_ -> "DATA"
     OK_ -> "OK"
     ERR_ -> "ERR"
     PONG_ -> "PONG"
@@ -795,6 +819,7 @@ instance ProtocolMsgTag BrokerMsgTag where
     "PRES" -> Just PRES_
     "END" -> Just END_
     "INFO" -> Just INFO_
+    "DATA" -> Just DATA_
     "OK" -> Just OK_
     "ERR" -> Just ERR_
     "PONG" -> Just PONG_
@@ -1169,11 +1194,37 @@ type RcvNtfPublicDhKey = C.PublicKeyX25519
 -- | DH Secret used to encrypt notification metadata from server to recipient
 type RcvNtfDhSecret = C.DhSecretX25519
 
+-- | private key to authorize owner access to data blobs
+type DataPrivateAuthKey = C.APrivateAuthKey
+
+-- | public key to authorize owner access to data blobs
+type DataPublicAuthKey = C.APublicAuthKey
+
 -- | SMP message server ID.
 type MsgId = ByteString
 
 -- | SMP message body.
 type MsgBody = ByteString
+
+data DataBlob = DataBlob
+  { dataNonce :: C.CbNonce,
+    dataBody :: ByteString
+  }
+  deriving (Eq, Show)
+
+instance Encoding DataBlob where
+  smpEncode DataBlob {dataNonce, dataBody} = smpEncode (dataNonce, Tail dataBody)
+  smpP = do
+    (dataNonce, Tail dataBody) <- smpP
+    pure DataBlob {dataNonce, dataBody}
+
+instance StrEncoding DataBlob where
+  strEncode DataBlob {dataNonce, dataBody} = strEncode (dataNonce, dataBody)
+  strP = do
+    (dataNonce, dataBody) <- strP
+    pure DataBlob {dataNonce, dataBody}
+
+type EncDataBlob = ByteString
 
 data ProtocolErrorType = PECmdSyntax | PECmdUnknown | PESession | PEBlock
 
@@ -1319,6 +1370,9 @@ instance PartyI p => ProtocolEncoding SMPVersion ErrorType (Command p) where
     OFF -> e OFF_
     DEL -> e DEL_
     QUE -> e QUE_
+    WRT k blob -> e (WRT_, ' ', k, blob)
+    CLR -> e CLR_
+    READ -> e READ_
     SKEY k -> e (SKEY_, ' ', k)
     SEND flags msg -> e (SEND_, ' ', flags, ' ', Tail msg)
     PING -> e PING_
@@ -1348,14 +1402,12 @@ instance PartyI p => ProtocolEncoding SMPVersion ErrorType (Command p) where
     SKEY _
       | isNothing auth || B.null entId -> Left $ CMD NO_AUTH
       | otherwise -> Right cmd
+    READ -> entityNoAuthCmd
     PING -> noAuthCmd
     PRXY {} -> noAuthCmd
-    PFWD {}
-      | B.null entId -> Left $ CMD NO_ENTITY
-      | isNothing auth -> Right cmd
-      | otherwise -> Left $ CMD HAS_AUTH
+    PFWD {} -> entityNoAuthCmd
     RFWD _ -> noAuthCmd
-    -- other client commands must have both signature and queue ID
+    -- other client commands must have both signature and entity ID
     _
       | isNothing auth || B.null entId -> Left $ CMD NO_AUTH
       | otherwise -> Right cmd
@@ -1365,6 +1417,11 @@ instance PartyI p => ProtocolEncoding SMPVersion ErrorType (Command p) where
       noAuthCmd
         | isNothing auth && B.null entId = Right cmd
         | otherwise = Left $ CMD HAS_AUTH
+      entityNoAuthCmd :: Either ErrorType (Command p)
+      entityNoAuthCmd
+        | B.null entId = Left $ CMD NO_ENTITY
+        | isJust auth = Left $ CMD HAS_AUTH
+        | otherwise = Right cmd
 
 instance ProtocolEncoding SMPVersion ErrorType Cmd where
   type Tag Cmd = CmdTag
@@ -1390,10 +1447,13 @@ instance ProtocolEncoding SMPVersion ErrorType Cmd where
         OFF_ -> pure OFF
         DEL_ -> pure DEL
         QUE_ -> pure QUE
+        WRT_ -> WRT <$> _smpP <*> smpP
+        CLR_ -> pure CLR
     CT SSender tag ->
       Cmd SSender <$> case tag of
         SKEY_ -> SKEY <$> _smpP
         SEND_ -> SEND <$> _smpP <*> (unTail <$> _smpP)
+        READ_ -> pure READ
         PING_ -> pure PING
         RFWD_ -> RFWD <$> (EncFwdTransmission . unTail <$> _smpP)
     CT SProxiedClient tag ->
@@ -1424,6 +1484,7 @@ instance ProtocolEncoding SMPVersion ErrorType BrokerMsg where
     PRES (EncResponse encBlock) -> e (PRES_, ' ', Tail encBlock)
     END -> e END_
     INFO info -> e (INFO_, ' ', info)
+    DATA body -> e (DATA_, ' ', Tail body)
     OK -> e OK_
     ERR err -> e (ERR_, ' ', err)
     PONG -> e PONG_
@@ -1449,6 +1510,7 @@ instance ProtocolEncoding SMPVersion ErrorType BrokerMsg where
     PRES_ -> PRES <$> (EncResponse . unTail <$> _smpP)
     END_ -> pure END
     INFO_ -> INFO <$> _smpP
+    DATA_ -> DATA . unTail <$> _smpP
     OK_ -> pure OK
     ERR_ -> ERR <$> _smpP
     PONG_ -> pure PONG

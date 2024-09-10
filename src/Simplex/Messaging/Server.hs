@@ -44,6 +44,8 @@ import Control.Monad.Except
 import Control.Monad.IO.Unlift
 import Control.Monad.Reader
 import Control.Monad.Trans.Except
+import qualified Crypto.PubKey.Curve25519 as X25519
+import qualified Crypto.Error as CE
 import Control.Monad.STM (retry)
 import Data.Bifunctor (first)
 import Data.ByteString.Base64 (encode)
@@ -81,6 +83,8 @@ import Simplex.Messaging.Encoding
 import Simplex.Messaging.Encoding.String
 import Simplex.Messaging.Protocol
 import Simplex.Messaging.Server.Control
+import Simplex.Messaging.Server.DataLog
+import Simplex.Messaging.Server.DataStore
 import Simplex.Messaging.Server.Env.STM as Env
 import Simplex.Messaging.Server.Expiration
 import Simplex.Messaging.Server.MsgStore
@@ -154,7 +158,11 @@ smpServer started cfg@ServerConfig {transports, transportConfig = tCfg} = do
     fromTLSCredentials (_, pk) = C.x509ToPrivate (pk, []) >>= C.privKey
 
     saveServer :: Bool -> M ()
-    saveServer keepMsgs = withLog closeStoreLog >> saveServerMessages keepMsgs >> saveServerStats
+    saveServer keepMsgs = do
+      withLog closeStoreLog
+      withLog' dataLog closeStoreLog
+      saveServerMessages keepMsgs
+      saveServerStats
 
     closeServer :: M ()
     closeServer = asks (smpAgent . proxyAgent) >>= liftIO . closeSMPClientAgent
@@ -727,7 +735,7 @@ receive h@THandle {params = THandleParams {thAuth}} Client {rcvQ, sndQ, rcvActiv
     write sndQ errs
     write rcvQ cmds
   where
-    updateBatchStats :: ServerStats -> [(Maybe QueueRec, Transmission Cmd)] -> M ()
+    updateBatchStats :: ServerStats -> [(VerificationResult, Transmission Cmd)] -> M ()
     updateBatchStats stats = \case
       (_, (_, _, (Cmd _ cmd))) : _ -> do
         let sel_ = case cmd of
@@ -738,14 +746,13 @@ receive h@THandle {params = THandleParams {thAuth}} Client {rcvQ, sndQ, rcvActiv
               _ -> Nothing
         mapM_ (\sel -> incStat $ sel stats) sel_
       [] -> pure ()
-    cmdAction :: ServerStats -> SignedTransmission ErrorType Cmd -> M (Either (Transmission BrokerMsg) (Maybe QueueRec, Transmission Cmd))
+    cmdAction :: ServerStats -> SignedTransmission ErrorType Cmd -> M (Either (Transmission BrokerMsg) (VerificationResult, Transmission Cmd))
     cmdAction stats (tAuth, authorized, (corrId, entId, cmdOrError)) =
       case cmdOrError of
         Left e -> pure $ Left (corrId, entId, ERR e)
         Right cmd -> verified =<< verifyTransmission ((,C.cbNonce (bs corrId)) <$> thAuth) tAuth authorized entId cmd
           where
             verified = \case
-              VRVerified qr -> pure $ Right (qr, (corrId, entId, cmd))
               VRFailed -> do
                 case cmd of
                   Cmd _ SEND {} -> incStat $ msgSentAuth stats
@@ -754,6 +761,7 @@ receive h@THandle {params = THandleParams {thAuth}} Client {rcvQ, sndQ, rcvActiv
                   Cmd _ GET -> incStat $ msgGetAuth stats
                   _ -> pure ()
                 pure $ Left (corrId, entId, ERR AUTH)
+              vRes -> pure $ Right (vRes, (corrId, entId, cmd))
     write q = mapM_ (atomically . writeTBQueue q) . L.nonEmpty
 
 send :: Transport c => MVar (THandleSMP c 'TServer) -> Client -> IO ()
@@ -805,8 +813,6 @@ disconnectTransport THandle {connection, params = THandleParams {sessionId}} rcv
       ts <- max <$> readTVarIO rcvActiveAt <*> readTVarIO sndActiveAt
       if systemSeconds ts < old then closeConnection connection else loop
 
-data VerificationResult = VRVerified (Maybe QueueRec) | VRFailed
-
 -- This function verifies queue command authorization, with the objective to have constant time between the three AUTH error scenarios:
 -- - the queue and party key exist, and the provided authorization has type matching queue key, but it is made with the different key.
 -- - the queue and party key exist, but the provided authorization has incorrect type.
@@ -814,13 +820,16 @@ data VerificationResult = VRVerified (Maybe QueueRec) | VRFailed
 -- In all cases, the time of the verification should depend only on the provided authorization type,
 -- a dummy key is used to run verification in the last two cases, and failure is returned irrespective of the result.
 verifyTransmission :: Maybe (THandleAuth 'TServer, C.CbNonce) -> Maybe TransmissionAuth -> ByteString -> QueueId -> Cmd -> M VerificationResult
-verifyTransmission auth_ tAuth authorized queueId cmd =
+verifyTransmission auth_ tAuth authorized entId cmd =
   case cmd of
     Cmd SRecipient (NEW k _ _ _ _) -> pure $ Nothing `verifiedWith` k
+    Cmd SRecipient (WRT k _) -> (\d -> d `verifiedData` (verify k && maybe True ((k ==) . dataKey) d)) <$> getData entId
+    Cmd SRecipient CLR -> maybe dummyVerify (\d -> Just d `verifiedData` verify (dataKey d)) <$> getData entId
     Cmd SRecipient _ -> verifyQueue (\q -> Just q `verifiedWith` recipientKey q) <$> get SRecipient
     -- SEND will be accepted without authorization before the queue is secured with KEY or SKEY command
     Cmd SSender (SKEY k) -> verifyQueue (\q -> Just q `verifiedWith` k) <$> get SSender
     Cmd SSender SEND {} -> verifyQueue (\q -> Just q `verified` maybe (isNothing tAuth) verify (senderKey q)) <$> get SSender
+    Cmd SSender READ -> maybe VRFailed (VRVerifiedData . Just) <$> getData (EntityId $ C.sha256Hash $ unEntityId entId)
     Cmd SSender PING -> pure $ VRVerified Nothing
     Cmd SSender RFWD {} -> pure $ VRVerified Nothing
     -- NSUB will not be accepted without authorization
@@ -833,10 +842,13 @@ verifyTransmission auth_ tAuth authorized queueId cmd =
     verifyQueue = either (const dummyVerify)
     verified q cond = if cond then VRVerified q else VRFailed
     verifiedWith q k = q `verified` verify k
+    verifiedData d cond = if cond then VRVerifiedData d else VRFailed
     get :: DirectParty p => SParty p -> M (Either ErrorType QueueRec)
     get party = do
       st <- asks queueStore
-      liftIO $ getQueue st party queueId
+      liftIO $ getQueue st party entId
+    getData :: BlobId -> M (Maybe DataRec)
+    getData blobId = atomically . TM.lookup blobId =<< asks dataStore
 
 verifyCmdAuthorization :: Maybe (THandleAuth 'TServer, C.CbNonce) -> Maybe TransmissionAuth -> ByteString -> C.APublicAuthKey -> Bool
 verifyCmdAuthorization auth_ tAuth authorized key = maybe False (verify key) tAuth
@@ -981,16 +993,15 @@ client thParams' clnt@Client {clientId, subscriptions, ntfSubscriptions, rcvQ, s
     mkIncProxyStats ps psOwn own sel = do
       incStat $ sel ps
       when own $ incStat $ sel psOwn
-    processCommand :: (Maybe QueueRec, Transmission Cmd) -> M (Maybe (Transmission BrokerMsg))
-    processCommand (qr_, (corrId, entId, cmd)) = case cmd of
+    processCommand :: (VerificationResult, Transmission Cmd) -> M (Maybe (Transmission BrokerMsg))
+    processCommand (vRes, (corrId, entId, cmd)) = case cmd of
       Cmd SProxiedClient command -> processProxiedCmd (corrId, entId, command)
       Cmd SSender command -> Just <$> case command of
-        SKEY sKey -> (corrId,entId,) <$> case qr_ of
-          Just qr@QueueRec {sndSecure}
-            | sndSecure -> secureQueue_ "SKEY" qr sKey
-            | otherwise -> pure $ ERR AUTH
-          Nothing -> pure $ ERR INTERNAL
+        SKEY sKey ->
+          withQueue $ \QueueRec {sndSecure, recipientId} ->
+            (corrId,entId,) <$> if sndSecure then secureQueue_ "SKEY" recipientId sKey else pure $ ERR AUTH
         SEND flags msgBody -> withQueue $ \qr -> sendMessage qr flags msgBody
+        READ -> getDataBlob
         PING -> pure (corrId, NoEntity, PONG)
         RFWD encBlock -> (corrId, NoEntity,) <$> processForwardedCommand encBlock
       Cmd SNotifier NSUB -> Just <$> subscribeNotifications
@@ -1009,14 +1020,16 @@ client thParams' clnt@Client {clientId, subscriptions, ntfSubscriptions, rcvQ, s
           SUB -> withQueue (`subscribeQueue` entId)
           GET -> withQueue getMessage
           ACK msgId -> withQueue (`acknowledgeMsg` msgId)
-          KEY sKey -> (corrId,entId,) <$> case qr_ of
-            Just qr -> secureQueue_ "KEY" qr sKey
-            Nothing -> pure $ ERR INTERNAL
+          KEY sKey ->
+            withQueue $ \QueueRec {recipientId} ->
+              (corrId,entId,) <$> secureQueue_ "KEY" recipientId sKey
           NKEY nKey dhKey -> addQueueNotifier_ st nKey dhKey
           NDEL -> deleteQueueNotifier_ st
           OFF -> suspendQueue_ st
           DEL -> delQueueAndMsgs st
           QUE -> withQueue getQueueInfo
+          WRT key blob -> storeDataBlob key blob
+          CLR -> deleteDataBlob
       where
         createQueue :: QueueStore -> RcvPublicAuthKey -> RcvPublicDhKey -> SubscriptionMode -> SenderCanSecure -> M (Transmission BrokerMsg)
         createQueue st recipientKey dhKey subMode sndSecure = time "NEW" $ do
@@ -1063,10 +1076,9 @@ client thParams' clnt@Client {clientId, subscriptions, ntfSubscriptions, rcvQ, s
               n <- asks $ queueIdBytes . config
               liftM2 (,) (randomId n) (randomId n)
 
-        secureQueue_ :: T.Text -> QueueRec -> SndPublicAuthKey -> M BrokerMsg
-        secureQueue_ name qr@QueueRec {recipientId = rId} sKey = time name $ do
+        secureQueue_ :: T.Text -> RecipientId -> SndPublicAuthKey -> M BrokerMsg
+        secureQueue_ name rId sKey = time name $ do
           withLog $ \s -> logSecureQueue s rId sKey
-          updateQueueDate qr
           st <- asks queueStore
           stats <- asks serverStats
           incStat $ qSecured stats
@@ -1175,9 +1187,9 @@ client thParams' clnt@Client {clientId, subscriptions, ntfSubscriptions, rcvQ, s
               pure r
 
         withQueue :: (QueueRec -> M (Transmission BrokerMsg)) -> M (Transmission BrokerMsg)
-        withQueue action = case qr_ of
-          Just qr -> updateQueueDate qr >> action qr
-          Nothing -> pure $ err INTERNAL
+        withQueue action = case vRes of
+          VRVerified (Just qr) -> updateQueueDate qr >> action qr
+          _ -> pure $ err INTERNAL
 
         updateQueueDate :: QueueRec -> M ()
         updateQueueDate QueueRec {updatedAt, recipientId = rId} = do
@@ -1424,7 +1436,7 @@ client thParams' clnt@Client {clientId, subscriptions, ntfSubscriptions, rcvQ, s
           incStat $ pMsgFwdsRecv stats
           pure $ RRES r3
           where
-            rejectOrVerify :: Maybe (THandleAuth 'TServer) -> SignedTransmission ErrorType Cmd -> M (Either (Transmission BrokerMsg) (Maybe QueueRec, Transmission Cmd))
+            rejectOrVerify :: Maybe (THandleAuth 'TServer) -> SignedTransmission ErrorType Cmd -> M (Either (Transmission BrokerMsg) (VerificationResult, Transmission Cmd))
             rejectOrVerify clntThAuth (tAuth, authorized, (corrId', entId', cmdOrError)) =
               case cmdOrError of
                 Left e -> pure $ Left (corrId', entId', ERR e)
@@ -1435,10 +1447,12 @@ client thParams' clnt@Client {clientId, subscriptions, ntfSubscriptions, rcvQ, s
                     allowed = case cmd' of
                       Cmd SSender SEND {} -> True
                       Cmd SSender (SKEY _) -> True
+                      Cmd SSender READ -> True
                       _ -> False
                     verified = \case
-                      VRVerified qr -> Right (qr, (corrId', entId', cmd'))
                       VRFailed -> Left (corrId', entId', ERR AUTH)
+                      vRes' -> Right (vRes', (corrId', entId', cmd'))
+
         deliverMessage :: T.Text -> QueueRec -> RecipientId -> Sub -> Maybe Message -> M (Transmission BrokerMsg)
         deliverMessage name qr rId s@Sub {subThread} msg_ = time (name <> " deliver") . atomically $
           case subThread of
@@ -1508,6 +1522,39 @@ client thParams' clnt@Client {clientId, subscriptions, ntfSubscriptions, rcvQ, s
               qDelivered <- atomically $ decodeLatin1 . encode <$$> tryReadTMVar delivered
               pure QSub {qSubThread, qDelivered}
 
+        storeDataBlob :: DataPublicAuthKey -> DataBlob -> M (Transmission BrokerMsg)
+        storeDataBlob dataKey dataBlob
+          | B.length (dataBody dataBlob) > e2eEncMessageLength = pure $ err LARGE_MSG
+          | otherwise = do
+              atomically . TM.insert entId d =<< asks dataStore
+              withLog' dataLog (`logCreateBlob` d)
+              pure ok
+          where
+            d = DataRec {dataId = entId, dataKey, dataBlob}
+
+        deleteDataBlob :: M (Transmission BrokerMsg)
+        deleteDataBlob = do
+          atomically . TM.delete entId =<< asks dataStore
+          withLog' dataLog (`logDeleteBlob` entId)
+          pure ok
+
+        getDataBlob :: M (Transmission BrokerMsg)
+        getDataBlob = case vRes of
+          VRVerifiedData (Just DataRec {dataBlob}) -> 
+            case thAuth thParams' of
+              Nothing -> pure $ err $ transportErr TENoServerAuth
+              Just THAuthServer {serverPrivKey} -> case X25519.publicKey $ unEntityId entId of
+                CE.CryptoFailed _ -> pure $ err AUTH
+                CE.CryptoPassed k -> do
+                  let secret = C.dh' (C.PublicKeyX25519 k) serverPrivKey
+                      nonce = C.cbNonce $ bs corrId
+                      THandleParams {thVersion} = thParams'
+                  pure . (corrId,entId,) $
+                    case C.cbEncrypt secret nonce (smpEncode dataBlob) (maxMessageLength thVersion) of
+                      Left _ -> ERR CRYPTO
+                      Right encBlob -> DATA encBlob
+          _ -> pure $ err INTERNAL
+
         ok :: Transmission BrokerMsg
         ok = (corrId, entId, OK)
 
@@ -1530,9 +1577,11 @@ incStat r = liftIO $ atomicModifyIORef'_ r (+ 1)
 {-# INLINE incStat #-}
 
 withLog :: (StoreLog 'WriteMode -> IO a) -> M ()
-withLog action = do
-  env <- ask
-  liftIO . mapM_ action $ storeLog (env :: Env)
+withLog = withLog' storeLog
+{-# INLINE withLog #-}
+
+withLog' :: (Env -> Maybe (StoreLog 'WriteMode)) -> (StoreLog 'WriteMode -> IO a) -> M ()
+withLog' sel action = liftIO . mapM_ action =<< asks sel
 
 timed :: MonadIO m => T.Text -> RecipientId -> m a -> m a
 timed name (EntityId qId) a = do
